@@ -230,37 +230,63 @@ static void usbd_stall(uint8_t epnr)
 
 static void usbd_clear_stall(uint8_t epnr)
 {
-    bool_t in, dbl_buf;
-    uint16_t epr;
-    int new_status = USB_STAT_VALID;
+    bool_t in;
+    struct ep *ep;
+    volatile struct usb_bufd *bd;
+    uint16_t old_epr, new_epr;
 
     in = !!(epnr & 0x80);
     epnr &= 0x7f;
-    epr = usb->epr[epnr];
-    dbl_buf = !!(epr & USB_EPR_EP_KIND_DBL_BUF);
+    ep = &eps[epnr];
+    bd = &usb_bufd[epnr];
 
-    /* Clear data toggle and set status to VALID or NAK as appropriate. */
-    if (in) {
-        if (dbl_buf) {
-            epr ^= 0x4000; /* Set SW_BUF */
+    old_epr = usb->epr[epnr];
+    new_epr = old_epr & 0x070f; /* preserve rw & t fields */
+
+    if (ep->is_dblbuf) {
+
+        /* Reset double-buffer ring and endpoint state to match
+         * usbd_configure_ep() initialisation. Buffer addresses
+         * (bd->addr_0/1) are not changed. */
+        uint32_t oldpri = IRQ_save(USB_IRQ_PRI);
+        ep->db.bufc = ep->db.bufp = ep->db.tx_hw_slots = 0;
+        if (in) {
+            bd->count_0 = bd->count_1 = 0;
+            /* TX: Clears SW_BUF. */
+            new_epr |= old_epr & 0x4000;
+            /* TX: Clears data toggle and sets status to VALID. */
+            new_epr |= (old_epr & 0x0070)
+                ^ USB_EPR_STAT_TX(USB_STAT_VALID);
+            ep->db.kick = TRUE;
         } else {
-            epr &= ~0x4000;
-            new_status = USB_STAT_NAK;
+            bd->count_0 = bd->count_1 = 0x8400; /* USB_FS_MPS */
+            /* RX: Sets SW_BUF. */
+            new_epr |= (old_epr & 0x0040) ^ 0x0040;
+            ep->db.kick = FALSE;
+            /* RX: Clears data toggle and sets status to VALID. */
+            new_epr |= (old_epr & 0x7000)
+                ^ USB_EPR_STAT_RX(USB_STAT_VALID);
         }
-        epr &= 0x477f; /* preserve rw & t, except tx toggle and status */
-        epr ^= USB_EPR_STAT_TX(new_status);
+        barrier();
+        usb->epr[epnr] = new_epr;
+        IRQ_restore(oldpri);
+
     } else {
-        if (dbl_buf) {
-            epr |= 0x0040; /* Clear SW_BUF */
-        } else {
-            epr &= ~0x0040;
-        }
-        epr &= 0x774f; /* preserve rw & t, except rx toggle and status */
-        epr ^= USB_EPR_STAT_RX(new_status);
-    }
 
-    epr |= 0x8080; /* preserve rc_w0 fields */
-    usb->epr[epnr] = epr;
+        /* Standard endpoint: clear data toggle, set status to NAK. */
+        if (in) {
+            new_epr |= old_epr & USB_EPR_DTOG_TX;
+            new_epr |= (old_epr & 0x0030)
+                ^ USB_EPR_STAT_TX(USB_STAT_NAK);
+        } else {
+            new_epr |= old_epr & USB_EPR_DTOG_RX;
+            new_epr |= (old_epr & 0x3000)
+                ^ USB_EPR_STAT_RX(USB_STAT_NAK);
+        }
+        new_epr |= 0x8080; /* preserve rc_w0 fields */
+        usb->epr[epnr] = new_epr;
+
+    }
 }
 
 static void usbd_configure_ep(uint8_t epnr, uint8_t type, uint32_t size)
